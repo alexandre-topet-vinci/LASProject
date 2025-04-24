@@ -1,0 +1,24 @@
+[package]
+name    = "pas-cman-ipl"
+version = "0.1.0"
+edition = "2021"
+description = "pas cman c'est pas pacman"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# using this very revision is necessary for systems running on wayland
+# see: https://github.com/amethyst/bracket-lib/issues/318
+bracket-lib = { git = "https://github.com/amethyst/bracket-lib.git", rev="0d2d5e6a9a8e7c7ae3710cfef85be4cab0109a27" }
+legion      = "0.4.0"
+structopt   = "0.3.26"
+
+[package.metadata.bundle]
+name       = "pas-cman"
+identifier = "com.github.xgillard.pas-cman"
+icon       = [ "icon.ico" ]
+version    = "0.1.0"
+resources  = [ "resources/map.txt", "resources/pas-cman-font-32.png", "resources/terminal8x8.png" ]
+category   = "game"
+copyright  = "MIT No Attribution Copyright 2024 -- Xavier GILLARD"
+short_description = "pas cman c'est pas pacman"
