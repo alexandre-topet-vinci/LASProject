@@ -3,6 +3,8 @@
 #define KEY 84937
 #define PERM 0666
 
+#define SERVER_PORT 74912
+
 void client_handler(int sig) {
     // Handler pour le signal SIGUSR1  
     int shm_id = sshmget(KEY, sizeof(int), IPC_CREAT | PERM);
@@ -11,7 +13,13 @@ void client_handler(int sig) {
     // Vous pouvez ajouter du code ici si nécessaire    
 
     sshmdt(distance); 
-    printf("Radar program finished.\n");
+}
+
+int initSocketServer(int serverPort){
+            int sockfd = ssocket();
+            sbind(serverPort, sockfd);
+            slisten(sockfd, BACKLOG);
+            return sockfd;
 }
 
 int main(int argc, char *argv[]) {
@@ -20,7 +28,6 @@ int main(int argc, char *argv[]) {
 
     int pipefdServerToBroadcast[2];
     spipe(pipefdServerToBroadcast);
-    sclose(pipefdServerToBroadcast[0]);
     struct GameState state;
     FileDescriptor sout = 1;
     FileDescriptor map  = sopen("./resources/map.txt", O_RDONLY, 0);
@@ -31,6 +38,7 @@ int main(int argc, char *argv[]) {
 
     pid_t client1 = sfork();
     if (client1 == 0) {
+        sclose(pipefdServerToBroadcast[0]);
         
         client_handler();
         exit(EXIT_SUCCESS);
@@ -38,13 +46,16 @@ int main(int argc, char *argv[]) {
     
     pid_t client2 = sfork();
     if (client2 == 0) {
+        sclose(pipefdServerToBroadcast[0]);
         
         client_handler();
         exit(EXIT_SUCCESS);
     }
     pid_t broadcast = sfork();
-    if (broadcast == 0) {
+    if (broadcast == 0) {   
+        sclose(pipefdServerToBroadcast[1]);
         // Code pour le processus de diffusion
+        int sockfd = initSocketServer(SERVER_PORT);
         
         exit(EXIT_SUCCESS);
     }
