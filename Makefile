@@ -2,7 +2,8 @@ CC=gcc
 
 CFLAGS=-std=c17 -pedantic -Wall -Wvla -Werror -Wno-unused-variable -Wno-unused-but-set-variable -D_DEFAULT_SOURCE
 
-all: exemple pas_client pas_server
+all: pas_client pas_server exemple 
+	chmod +x pas_client pas_server exemple
 
 exemple: exemple.o game.o utils_v3.o
 	$(CC) $(CFLAGS) -o exemple exemple.o game.o utils_v3.o
