@@ -18,7 +18,7 @@
 #define BACKLOG 5
 #define REGISTRATION_TIMEOUT 30 // 30 seconds timeout for registration
 #define MAX_CLIENTS 2
-#define MAP_FILE "./resources/map.txt"
+#define DEFAULT_MAP_FILE "./resources/map.txt"
 
 // Semaphores
 #define SEM_KEY 84938
@@ -36,6 +36,7 @@ int broadcast_pipe[2] = {-1, -1};
 pid_t broadcaster_pid = -1;
 pid_t client_handlers[MAX_CLIENTS] = {-1, -1};
 bool running = true;
+char *g_map_file = DEFAULT_MAP_FILE;
 
 void cleanup() {
     // Kill client handlers
@@ -208,8 +209,8 @@ void client_handler(int client_num, int client_socket) {
         usleep(100000);  // 100ms
         
         // Load map and broadcast initial state
-        printf("Loading map from %s\n", MAP_FILE);
-        FileDescriptor map_fd = sopen(MAP_FILE, O_RDONLY, 0);
+        printf("Loading map from %s\n", g_map_file);
+        FileDescriptor map_fd = sopen(g_map_file, O_RDONLY, 0);
         if (map_fd >= 0) {
             load_map(map_fd, broadcast_pipe[1], state);
             sclose(map_fd);
@@ -281,8 +282,12 @@ int main(int argc, char *argv[]) {
     if (argc > 1) {
         port = atoi(argv[1]);
     }
+
+    if (argc > 2) {
+        g_map_file = argv[2];
+    }
     
-    printf("Starting PAS-CMAN server...\n");
+    printf("Starting PAS-CMAN server on port %d using map %s...\n", port, g_map_file);
     
     // Set up signal handlers
     struct sigaction sa;

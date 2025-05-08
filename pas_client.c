@@ -22,6 +22,7 @@ int ui_to_client_pipe[2] = {-1, -1};
 int client_to_ui_pipe[2] = {-1, -1};
 pid_t ui_pid = -1;
 bool running = true;
+bool test_mode = false;
 
 void cleanup() {
     // Close socket
@@ -134,6 +135,11 @@ int main(int argc, char *argv[]) {
     if (argc >= 3) {
         server_port = atoi(argv[2]);
     }
+    if (argc >= 4 && strcmp(argv[3], "-test") == 0) {
+        test_mode = true;
+        printf("Running in test mode - reading movements from stdin\n");
+    }
+    
     
     // Set up signal handler
     struct sigaction sa;
@@ -150,47 +156,49 @@ int main(int argc, char *argv[]) {
     spipe(client_to_ui_pipe);  // Client writes, UI reads
     
     // Check if UI executable exists before forking
-    if (access(UI_PATH, X_OK) != 0) {
+    if (!test_mode && access(UI_PATH, X_OK) != 0) {
         perror("UI executable not found or not executable");
         printf("Please make sure %s exists and has execute permissions\n", UI_PATH);
         cleanup();
         exit(EXIT_FAILURE);
     }
     
-    // Create UI process
-    ui_pid = sfork();
-    if (ui_pid == 0) {
-        // Child process (UI)
+    // Create UI process (only in normal mode, not test mode)
+    if (!test_mode) {
+        ui_pid = sfork();
+        if (ui_pid == 0) {
+            // Child process (UI)
+            
+            // Set up stdin/stdout redirection
+            sclose(ui_to_client_pipe[0]);  // Close read end
+            sclose(client_to_ui_pipe[1]);  // Close write end
+            
+            // Redirect stdout to write to ui_to_client_pipe
+            sdup2(ui_to_client_pipe[1], STDOUT_FILENO);
+            sclose(ui_to_client_pipe[1]);
+            
+            // Redirect stdin to read from client_to_ui_pipe
+            sdup2(client_to_ui_pipe[0], STDIN_FILENO);
+            sclose(client_to_ui_pipe[0]);
+            
+            // Execute UI program avec execv au lieu de execl pour plus de fiabilité
+            char *args[] = {UI_PATH, NULL};
+            execv(UI_PATH, args);
+            
+            // If execv returns, there was an error
+            perror("UI execution failed");
+            printf("Failed to execute %s - make sure it exists and has execute permissions\n", UI_PATH);
+            exit(EXIT_FAILURE);
+        }
         
-        // Set up stdin/stdout redirection
-        sclose(ui_to_client_pipe[0]);  // Close read end
-        sclose(client_to_ui_pipe[1]);  // Close write end
+        // Parent process (client)
+        sclose(ui_to_client_pipe[1]);  // Close write end
+        sclose(client_to_ui_pipe[0]);  // Close read end
         
-        // Redirect stdout to write to ui_to_client_pipe
-        sdup2(ui_to_client_pipe[1], STDOUT_FILENO);
-        sclose(ui_to_client_pipe[1]);
-        
-        // Redirect stdin to read from client_to_ui_pipe
-        sdup2(client_to_ui_pipe[0], STDIN_FILENO);
-        sclose(client_to_ui_pipe[0]);
-        
-        // Execute UI program avec execv au lieu de execl pour plus de fiabilité
-        char *args[] = {UI_PATH, NULL};
-        execv(UI_PATH, args);
-        
-        // If execv returns, there was an error
-        perror("UI execution failed");
-        printf("Failed to execute %s - make sure it exists and has execute permissions\n", UI_PATH);
-        exit(EXIT_FAILURE);
+        // Add delay before connecting to server
+        printf("Initializing UI, waiting 1 second before connecting to server...\n");
+        usleep(1000000);  // 1 second delay
     }
-    
-    // Parent process (client)
-    sclose(ui_to_client_pipe[1]);  // Close write end
-    sclose(client_to_ui_pipe[0]);  // Close read end
-    
-    // Add delay before connecting to server
-    printf("Initializing UI, waiting 1 second before connecting to server...\n");
-    usleep(1000000);  // 1 second delay
     
     // Connect to server
     printf("Connecting to server at %s:%d...\n", server_ip, server_port);
@@ -198,11 +206,16 @@ int main(int argc, char *argv[]) {
     sconnect(server_ip, server_port, server_socket);
     printf("Connected to server\n");
     
-    // Set up polling for server and UI
+    // Set up polling for server and UI/stdin
     struct pollfd poll_fds[2];
     poll_fds[0].fd = server_socket;
     poll_fds[0].events = POLLIN;
-    poll_fds[1].fd = ui_to_client_pipe[0];
+    
+    if (test_mode) {
+        poll_fds[1].fd = STDIN_FILENO;
+    } else {
+        poll_fds[1].fd = ui_to_client_pipe[0];
+    }
     poll_fds[1].events = POLLIN;
     
     // Main client loop
@@ -274,7 +287,7 @@ int main(int argc, char *argv[]) {
                 printf("Client received message #%d of type %d\n", message_count, msg.msgt);
                 
                 // Forward message to UI (except for GAME_OVER which we'll handle specially)
-                if (msg.msgt != GAME_OVER) {
+                if (!test_mode && msg.msgt != GAME_OVER) {
                     // Débug pour messages SPAWN
                     if (msg.msgt == SPAWN) {
                         printf("Forwarding SPAWN: id=%u, item=%d, pos=(%u,%u)\n", 
@@ -311,28 +324,56 @@ int main(int argc, char *argv[]) {
                 }
             }
             
-            // Check for data from UI
+            // Check for data from UI or stdin
             if (poll_fds[1].revents & POLLIN) {
-                enum Direction dir;
-                ssize_t bytes_read = sread(ui_to_client_pipe[0], &dir, sizeof(enum Direction));
-                
-                if (bytes_read <= 0) {
-                    printf("UI disconnected\n");
-                    running = false;
-                    break;
-                }
-                
-                // If we're in game over state, any input means "exit"
-                if (game_over || poll_fds[0].fd == -1) {
-                    printf("User pressed key after game over, exiting...\n");
-                    running = false;
-                    break;
-                }
-                
-                // Otherwise forward direction to server
-                printf("Sending direction %d to server\n", dir);
-                if (swrite(server_socket, &dir, sizeof(enum Direction)) <= 0) {
-                    perror("Failed to send direction to server");
+                if (test_mode) {
+                    // Read movement from stdin in test mode
+                    char movement;
+                    ssize_t bytes_read = read(STDIN_FILENO, &movement, 1);
+                    
+                    if (bytes_read <= 0) {
+                        printf("Test input stream closed\n");
+                        running = false;
+                        break;
+                    }
+                    
+                    // Convert character to direction
+                    enum Direction direction;
+                    switch(movement) {
+                        case '^': direction = UP; break;
+                        case 'v': direction = DOWN; break;
+                        case '<': direction = LEFT; break;
+                        case '>': direction = RIGHT; break;
+                        default: continue;  // Ignore other characters
+                    }
+                    
+                    printf("Sending direction %d to server from test input\n", direction);
+                    if (swrite(server_socket, &direction, sizeof(enum Direction)) <= 0) {
+                        perror("Failed to send direction to server");
+                    }
+                } else {
+                    // Regular mode - read from UI pipe
+                    enum Direction dir;
+                    ssize_t bytes_read = sread(ui_to_client_pipe[0], &dir, sizeof(enum Direction));
+                    
+                    if (bytes_read <= 0) {
+                        printf("UI disconnected\n");
+                        running = false;
+                        break;
+                    }
+                    
+                    // If we're in game over state, any input means "exit"
+                    if (game_over || poll_fds[0].fd == -1) {
+                        printf("User pressed key after game over, exiting...\n");
+                        running = false;
+                        break;
+                    }
+                    
+                    // Otherwise forward direction to server
+                    printf("Sending direction %d to server\n", dir);
+                    if (swrite(server_socket, &dir, sizeof(enum Direction)) <= 0) {
+                        perror("Failed to send direction to server");
+                    }
                 }
             }
             
