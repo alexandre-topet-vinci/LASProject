@@ -15,6 +15,7 @@
 #define SERVER_PORT 74912
 #define UI_PATH "./pas-cman-ipl"
 #define BUFFER_SIZE 1024
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 // Global variables for cleanup
 int server_socket = -1;
@@ -156,49 +157,47 @@ int main(int argc, char *argv[]) {
     spipe(client_to_ui_pipe);  // Client writes, UI reads
     
     // Check if UI executable exists before forking
-    if (!test_mode && access(UI_PATH, X_OK) != 0) {
+    if (access(UI_PATH, X_OK) != 0) {
         perror("UI executable not found or not executable");
         printf("Please make sure %s exists and has execute permissions\n", UI_PATH);
         cleanup();
         exit(EXIT_FAILURE);
     }
     
-    // Create UI process (only in normal mode, not test mode)
-    if (!test_mode) {
-        ui_pid = sfork();
-        if (ui_pid == 0) {
-            // Child process (UI)
-            
-            // Set up stdin/stdout redirection
-            sclose(ui_to_client_pipe[0]);  // Close read end
-            sclose(client_to_ui_pipe[1]);  // Close write end
-            
-            // Redirect stdout to write to ui_to_client_pipe
-            sdup2(ui_to_client_pipe[1], STDOUT_FILENO);
-            sclose(ui_to_client_pipe[1]);
-            
-            // Redirect stdin to read from client_to_ui_pipe
-            sdup2(client_to_ui_pipe[0], STDIN_FILENO);
-            sclose(client_to_ui_pipe[0]);
-            
-            // Execute UI program avec execv au lieu de execl pour plus de fiabilité
-            char *args[] = {UI_PATH, NULL};
-            execv(UI_PATH, args);
-            
-            // If execv returns, there was an error
-            perror("UI execution failed");
-            printf("Failed to execute %s - make sure it exists and has execute permissions\n", UI_PATH);
-            exit(EXIT_FAILURE);
-        }
+    // Create UI process (always - even in test mode)
+    ui_pid = sfork();
+    if (ui_pid == 0) {
+        // Child process (UI)
         
-        // Parent process (client)
-        sclose(ui_to_client_pipe[1]);  // Close write end
-        sclose(client_to_ui_pipe[0]);  // Close read end
+        // Set up stdin/stdout redirection
+        sclose(ui_to_client_pipe[0]);  // Close read end
+        sclose(client_to_ui_pipe[1]);  // Close write end
         
-        // Add delay before connecting to server
-        printf("Initializing UI, waiting 1 second before connecting to server...\n");
-        usleep(1000000);  // 1 second delay
+        // Redirect stdout to write to ui_to_client_pipe
+        sdup2(ui_to_client_pipe[1], STDOUT_FILENO);
+        sclose(ui_to_client_pipe[1]);
+        
+        // Redirect stdin to read from client_to_ui_pipe
+        sdup2(client_to_ui_pipe[0], STDIN_FILENO);
+        sclose(client_to_ui_pipe[0]);
+        
+        // Execute UI program
+        char *args[] = {UI_PATH, NULL};
+        execv(UI_PATH, args);
+        
+        // If execv returns, there was an error
+        perror("UI execution failed");
+        printf("Failed to execute %s - make sure it exists and has execute permissions\n", UI_PATH);
+        exit(EXIT_FAILURE);
     }
+
+    // Parent process (client)
+    sclose(ui_to_client_pipe[1]);  // Close write end
+    sclose(client_to_ui_pipe[0]);  // Close read end
+
+    // Add delay before connecting to server
+    printf("Initializing UI, waiting 1 second before connecting to server...\n");
+    usleep(1000000);  // 1 second delay
     
     // Connect to server
     printf("Connecting to server at %s:%d...\n", server_ip, server_port);
@@ -207,16 +206,25 @@ int main(int argc, char *argv[]) {
     printf("Connected to server\n");
     
     // Set up polling for server and UI/stdin
-    struct pollfd poll_fds[2];
+    struct pollfd poll_fds[3];  // Make sure we have space for 3 fds
     poll_fds[0].fd = server_socket;
     poll_fds[0].events = POLLIN;
     
+    // Set up the proper input sources based on mode
+    int poll_count;
     if (test_mode) {
+        // In test mode, monitor both stdin and UI
         poll_fds[1].fd = STDIN_FILENO;
+        poll_fds[1].events = POLLIN;
+        poll_fds[2].fd = ui_to_client_pipe[0];
+        poll_fds[2].events = POLLIN;
+        poll_count = 3;
     } else {
+        // In normal mode, just monitor UI
         poll_fds[1].fd = ui_to_client_pipe[0];
+        poll_fds[1].events = POLLIN;
+        poll_count = 2;
     }
-    poll_fds[1].events = POLLIN;
     
     // Main client loop
     bool game_over = false;
@@ -224,7 +232,7 @@ int main(int argc, char *argv[]) {
     int message_count = 0;
     
     while (running) {
-        int poll_result = spoll(poll_fds, 2, 500);  // 500ms timeout pour vérifier running régulièrement
+        int poll_result = spoll(poll_fds, poll_count, 500);
         
         if (poll_result > 0) {
             // Check for data from server
@@ -286,19 +294,18 @@ int main(int argc, char *argv[]) {
                 message_count++;
                 printf("Client received message #%d of type %d\n", message_count, msg.msgt);
                 
-                // Forward message to UI (except for GAME_OVER which we'll handle specially)
-                if (!test_mode && msg.msgt != GAME_OVER) {
-                    // Débug pour messages SPAWN
+                // Forward message to UI (always, except for GAME_OVER which we handle specially)
+                if (msg.msgt != GAME_OVER) {
                     if (msg.msgt == SPAWN) {
                         printf("Forwarding SPAWN: id=%u, item=%d, pos=(%u,%u)\n", 
                                msg.spawn.id, msg.spawn.item, msg.spawn.pos.x, msg.spawn.pos.y);
                     }
                     
-                    // Assurer que les messages SPAWN sont correctement envoyés à l'UI
+                    // Always forward messages to UI regardless of mode
                     if (swrite(client_to_ui_pipe[1], &msg, sizeof(union Message)) < 0) {
                         perror("Failed to forward message to UI");
                     } else {
-                        fsync(client_to_ui_pipe[1]); // S'assurer que le message est envoyé immédiatement
+                        fsync(client_to_ui_pipe[1]); // Ensure message is sent immediately
                     }
                 }
                 
@@ -324,68 +331,110 @@ int main(int argc, char *argv[]) {
                 }
             }
             
-            // Check for data from UI or stdin
-            if (poll_fds[1].revents & POLLIN) {
-                if (test_mode) {
-                    // Read movement from stdin in test mode
-                    char movement;
-                    ssize_t bytes_read = read(STDIN_FILENO, &movement, 1);
+            // Handle test input from stdin
+            if (test_mode && (poll_fds[1].revents & POLLIN)) {
+                // Read movement from stdin in test mode
+                char buffer[256];
+                ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer)-1);
+                
+                if (bytes_read <= 0) {
+                    printf("Test input stream closed\n");
+                    running = false;
+                    break;
+                }
+                
+                // Null terminate the string
+                buffer[bytes_read] = '\0';
+                
+                // Check if this is a test status message (starting with "TEST:")
+                if (strncmp(buffer, "TEST:", 5) == 0) {
+                    // First, create a SPAWN message to create a marker at a specific position
+                    union Message ui_msg;
+                    memset(&ui_msg, 0, sizeof(union Message));
+                    ui_msg.msgt = SPAWN;
+                    ui_msg.spawn.msgt = SPAWN;
+                    ui_msg.spawn.id = 9999; // Special ID for test messages
+                    ui_msg.spawn.item = FOOD; // Use FOOD as a visible marker
+                    ui_msg.spawn.pos.x = 1;
+                    ui_msg.spawn.pos.y = 1;
                     
-                    if (bytes_read <= 0) {
-                        printf("Test input stream closed\n");
-                        running = false;
-                        break;
-                    }
+                    // Send the SPAWN message to create a marker
+                    write(client_to_ui_pipe[1], &ui_msg, sizeof(union Message));
                     
-                    // Convert character to direction
-                    enum Direction direction;
-                    switch(movement) {
-                        case '^': direction = UP; break;
-                        case 'v': direction = DOWN; break;
-                        case '<': direction = LEFT; break;
-                        case '>': direction = RIGHT; break;
-                        default: continue;  // Ignore other characters
-                    }
+                    // Then create a MOVEMENT message with the test text (displayed near the marker)
+                    memset(&ui_msg, 0, sizeof(union Message));
+                    ui_msg.msgt = MOVEMENT;
+                    ui_msg.movement.msgt = MOVEMENT;
+                    ui_msg.movement.id = 9999; // Same ID as the spawn
+                    ui_msg.movement.pos.x = 2; // Offset from the marker
+                    ui_msg.movement.pos.y = 1;
                     
-                    printf("Sending direction %d to server from test input\n", direction);
-                    if (swrite(server_socket, &direction, sizeof(enum Direction)) <= 0) {
-                        perror("Failed to send direction to server");
-                    }
-                } else {
-                    // Regular mode - read from UI pipe
-                    enum Direction dir;
-                    ssize_t bytes_read = sread(ui_to_client_pipe[0], &dir, sizeof(enum Direction));
+                    // Send the MOVEMENT message
+                    write(client_to_ui_pipe[1], &ui_msg, sizeof(union Message));
                     
-                    if (bytes_read <= 0) {
-                        printf("UI disconnected\n");
-                        running = false;
-                        break;
-                    }
-                    
-                    // If we're in game over state, any input means "exit"
-                    if (game_over || poll_fds[0].fd == -1) {
-                        printf("User pressed key after game over, exiting...\n");
-                        running = false;
-                        break;
-                    }
-                    
-                    // Otherwise forward direction to server
-                    printf("Sending direction %d to server\n", dir);
-                    if (swrite(server_socket, &dir, sizeof(enum Direction)) <= 0) {
-                        perror("Failed to send direction to server");
-                    }
+                    // Flush to ensure immediate display
+                    fsync(client_to_ui_pipe[1]);
+                    continue;
+                }
+                
+                // Handle regular movement commands
+                enum Direction direction;
+                switch(buffer[0]) {
+                    case '^': direction = UP; break;
+                    case 'v': direction = DOWN; break;
+                    case '<': direction = LEFT; break;
+                    case '>': direction = RIGHT; break;
+                    default: continue;  // Ignore other characters
+                }
+                
+                printf("Sending direction %d to server from test input\n", direction);
+                if (swrite(server_socket, &direction, sizeof(enum Direction)) <= 0) {
+                    perror("Failed to send direction to server");
+                }
+            }
+            
+            // Handle UI input (both in normal and test mode)
+            int ui_poll_fd_index = test_mode ? 2 : 1;
+            if (poll_fds[ui_poll_fd_index].revents & POLLIN) {
+                enum Direction dir;
+                ssize_t bytes_read = sread(poll_fds[ui_poll_fd_index].fd, &dir, sizeof(enum Direction));
+                
+                if (bytes_read <= 0) {
+                    printf("UI disconnected\n");
+                    running = false;
+                    break;
+                }
+                
+                // If we're in game over state, any input means "exit"
+                if (game_over || poll_fds[0].fd == -1) {
+                    printf("User pressed key after game over, exiting...\n");
+                    running = false;
+                    break;
+                }
+                
+                // Otherwise forward direction to server
+                printf("Sending direction %d to server from UI\n", dir);
+                if (swrite(server_socket, &dir, sizeof(enum Direction)) <= 0) {
+                    perror("Failed to send direction to server");
                 }
             }
             
             // Check if either endpoint has closed with POLLHUP or POLLERR
             if ((poll_fds[0].revents & (POLLHUP | POLLERR)) || 
                 (poll_fds[1].revents & (POLLHUP | POLLERR))) {
-                printf("Connection closed\n");
+                printf("Connection closed (POLLHUP or POLLERR)\n");
+                running = false;
+                break;
+            }
+            
+            // Check the third fd in test mode
+            if (test_mode && (poll_fds[2].revents & (POLLHUP | POLLERR))) {
+                printf("UI pipe closed (POLLHUP or POLLERR)\n");
                 running = false;
                 break;
             }
         }
-        // Si poll timeout, juste continuer pour vérifier running périodiquement
+        // If poll timeout, just continue to check running periodically
     }
     
     printf("Client shutting down\n");
