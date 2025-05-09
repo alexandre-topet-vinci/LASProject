@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <poll.h>
+#include <errno.h>
 
 #define KEY 84937
 #define PERM 0660
@@ -25,6 +26,13 @@
 #define SEM_MUTEX 0
 #define SEM_SYNC 1
 
+// Server phases
+typedef enum {
+    PHASE_IDLE,           // Server is waiting for first player to connect
+    PHASE_REGISTRATION,   // Registration phase (after first player connected)
+    PHASE_GAME            // Game in progress
+} ServerPhase;
+
 // Forward declaration for function not exposed in game.h
 void send_game_over(enum Item winner, FileDescriptor fdbcast);
 
@@ -36,22 +44,67 @@ int broadcast_pipe[2] = {-1, -1};
 pid_t broadcaster_pid = -1;
 pid_t client_handlers[MAX_CLIENTS] = {-1, -1};
 bool running = true;
+bool shutdown_requested = false; // Flag to track if SIGINT was received
+bool registration_timed_out = false; // Flag to track registration timeout
+ServerPhase current_phase = PHASE_IDLE; // Current server phase
 char *g_map_file = DEFAULT_MAP_FILE;
 
 void cleanup() {
+    // Block all signals during cleanup to avoid interruptions
+    sigset_t mask_all, prev_mask;
+    sigfillset(&mask_all);
+    sigprocmask(SIG_SETMASK, &mask_all, &prev_mask);
+    
     // Kill client handlers
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (client_handlers[i] > 0) {
             skill(client_handlers[i], SIGTERM);
-            waitpid(client_handlers[i], NULL, 0);
+            // Use waitpid with error handling
+            int status;
+            pid_t result;
+            int wait_attempts = 0;
+            int max_wait_attempts = 5;
+            
+            do {
+                result = waitpid(client_handlers[i], &status, WNOHANG);
+                if (result == 0) {
+                    // Process still running, give it a moment
+                    usleep(50000); // 50ms delay
+                    wait_attempts++;
+                    if (wait_attempts >= max_wait_attempts) {
+                        // If we've waited too long, forcibly kill the process
+                        printf("Client handler %d not responding, sending SIGKILL\n", i+1);
+                        kill(client_handlers[i], SIGKILL);
+                    }
+                }
+            } while (result == 0 && wait_attempts < max_wait_attempts*2);
+            
             client_handlers[i] = -1;
         }
     }
-    
-    // Kill broadcaster
+      // Kill broadcaster
     if (broadcaster_pid > 0) {
         skill(broadcaster_pid, SIGTERM);
-        waitpid(broadcaster_pid, NULL, 0);
+        // Use waitpid with error handling
+        int status;
+        pid_t result;
+        int wait_attempts = 0;
+        int max_wait_attempts = 5;
+        
+        do {
+            result = waitpid(broadcaster_pid, &status, WNOHANG);
+            if (result == 0) {
+                // Process still running, give it a moment
+                usleep(50000); // 50ms delay
+                wait_attempts++;
+                if (wait_attempts >= max_wait_attempts) {
+                    // If we've waited too long, forcibly kill the process
+                    printf("Broadcaster not responding, sending SIGKILL\n");
+                    kill(broadcaster_pid, SIGKILL);
+                }
+            }
+        } while (result == 0 && wait_attempts < max_wait_attempts*2);
+        
         broadcaster_pid = -1;
     }
     
@@ -65,9 +118,16 @@ void cleanup() {
         broadcast_pipe[1] = -1;
     }
     
-    // Close server socket
+    // Close server socket - try multiple times if needed
     if (sockfd != -1) {
-        sclose(sockfd);
+        int close_attempts = 0;
+        while (close_attempts < 3) {
+            if (close(sockfd) == 0 || errno != EBADF) {
+                break;  // Successfully closed or different error
+            }
+            usleep(50000);  // 50ms delay between attempts
+            close_attempts++;
+        }
         sockfd = -1;
     }
     
@@ -75,26 +135,99 @@ void cleanup() {
     if (shm_id != -1) {
         sshmdelete(shm_id);
         shm_id = -1;
-    }
-    
-    // Clean up semaphores
+    }        // Clean up semaphores - try multiple times if needed
     if (sem_id != -1) {
-        sem_delete(sem_id);
+        int sem_attempts = 0;
+        while (sem_attempts < 3) {
+            errno = 0;
+            sem_delete(sem_id);
+            if (errno == 0 || errno != EINVAL) {
+                break;  // Successfully deleted or different error
+            }
+            usleep(50000);  // 50ms delay between attempts
+            sem_attempts++;
+        }
         sem_id = -1;
     }
+    
+    // Set this flag to prevent double cleanup in some error cases
+    static int already_cleaned_up = 0;
+    already_cleaned_up = 1;
+    
+    // Restore previous signal mask
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
     
     printf("Server cleaned up and exiting\n");
 }
 
-// Signal handler for SIGINT
+// Empty handler for SIGUSR1 (used to unblock waitpid)
+void sigusr1_handler(int sig) {
+    // Do nothing, this is just to wake up processes blocked in system calls
+}
+
+// Signal handler for SIGINT and SIGALRM
 void sigint_handler(int sig) {
     if (sig == SIGINT) {
-        printf("SIGINT received, server will stop after current game\n");
-        running = false;
+        // If we already requested shutdown, don't show the message again
+        if (shutdown_requested) {
+            return;
+        }
+
+        const char *phase_name;
+        switch (current_phase) {
+            case PHASE_IDLE:
+                phase_name = "idle";
+                break;
+            case PHASE_REGISTRATION:
+                phase_name = "registration";
+                break;
+            case PHASE_GAME:
+                phase_name = "game";
+                break;
+            default:
+                phase_name = "unknown";
+        }
+          // Set the shutdown flag
+        shutdown_requested = true;
+        
+        // Only set running=false immediately if we're in IDLE phase
+        if (current_phase == PHASE_IDLE) {
+            printf("SIGINT received during %s phase, server will stop immediately\n", phase_name);
+            running = false;
+        } else {
+            printf("SIGINT received during %s phase, server will stop after current phase completes\n", phase_name);
+            // For other phases, we'll check the shutdown_requested flag 
+            // when transitioning back to IDLE
+              
+            // For game phase, we should let the game complete
+            if (current_phase == PHASE_GAME) {
+                printf("Server will continue running until the game completes naturally.\n");
+                printf("Clients will continue to operate normally.\n");
+            }
+        }
     } else if (sig == SIGALRM) {
-        printf("Connection timeout: No clients connected within 30 seconds\n");
-        running = false;
+        printf("Registration timeout: Not enough players connected within 30 seconds\n");
+        registration_timed_out = true; // Set the flag when the alarm occurs
     }
+}
+
+// Custom poll function that handles EINTR (interrupted by signal)
+int poll_with_retry(struct pollfd *fds, nfds_t nfds, int timeout) {
+    int ret;
+    while ((ret = poll(fds, nfds, timeout)) == -1 && errno == EINTR) {
+        // If interrupted by a signal, check if it was SIGALRM during registration
+        if (registration_timed_out) {
+            // Return 0 to indicate timeout, which will cause the main loop to process the timeout
+            return 0;
+        }
+        
+        printf("Poll interrupted by signal, retrying...\n");
+        continue;
+    }
+    
+    // For other errors, use the standard error checking
+    checkNeg(ret, "poll failure");
+    return ret;
 }
 
 // Broadcaster process - reads messages from pipe and forwards to clients
@@ -108,7 +241,7 @@ void broadcaster_process(void* pipe_read_fd) {
     
     while (1) {
         // Poll for incoming messages
-        int poll_result = spoll(&poll_fd, 1, -1);
+        int poll_result = poll_with_retry(&poll_fd, 1, -1);
         
         if (poll_result > 0 && (poll_fd.revents & POLLIN)) {
             // Nous allons lire le message complet
@@ -224,12 +357,24 @@ void client_handler(int client_num, int client_socket) {
         printf("Player 2 signaling readiness to Player 1\n");
         sem_up(sem_id, SEM_SYNC);  // Signal to Player 1
     }
-    
-    while (game_running && running) {
-        // Wait for direction input from client
-        ssize_t bytes_read = sread(client_socket, direction_buffer, sizeof(direction_buffer));
+      while (game_running && running) {
+        // Wait for direction input from client - handle EINTR specially
+        ssize_t bytes_read;
+        do {
+            bytes_read = read(client_socket, direction_buffer, sizeof(direction_buffer));
+            if (bytes_read < 0 && errno == EINTR) {
+                // If interrupted by signal, just try again
+                printf("Client %d read was interrupted by signal, retrying...\n", client_num);
+                continue;
+            }
+        } while (bytes_read < 0 && errno == EINTR);
+        
+        // Check for other errors
         if (bytes_read <= 0) {
             // Client disconnected or error
+            if (bytes_read < 0) {
+                perror("Client read error");
+            }
             printf("Client %d disconnected\n", client_num);
             break;
         }
@@ -288,14 +433,20 @@ int main(int argc, char *argv[]) {
     }
     
     printf("Starting PAS-CMAN server on port %d using map %s...\n", port, g_map_file);
-    
-    // Set up signal handlers
+      // Set up signal handlers
     struct sigaction sa;
     sa.sa_handler = sigint_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGALRM, &sa, NULL);
+    
+    // Set up SIGUSR1 handler
+    struct sigaction sa_usr1;
+    sa_usr1.sa_handler = sigusr1_handler;
+    sigemptyset(&sa_usr1.sa_mask);
+    sa_usr1.sa_flags = 0;
+    sigaction(SIGUSR1, &sa_usr1, NULL);
     
     // Register atexit handler
     atexit(cleanup);
@@ -310,13 +461,46 @@ int main(int argc, char *argv[]) {
     reset_gamestate(state);
     
     // Create the broadcast pipe
-    spipe(broadcast_pipe);
-    
-    // Create and set up server socket
+    spipe(broadcast_pipe);    // Create and set up server socket
     sockfd = ssocket();
+    
+    // Set SO_REUSEADDR to allow binding to a recently closed socket
     int option_value = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option_value, sizeof(int));
-    sbind(port, sockfd);
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option_value, sizeof(int)) < 0) {
+        perror("Error setting socket options");
+    }
+      
+    // Try to bind with timeout in case previous instance didn't fully release the port
+    int bind_attempts = 0;
+    int max_attempts = 5;
+    while (bind_attempts < max_attempts) {
+        // Try to use sbind from utils_v3
+        int bind_result = sbind(port, sockfd);
+        
+        if (bind_result == 0) {
+            break; // Successfully bound
+        }
+        
+        // If binding failed, check if it was an "Address already in use" error
+        if (errno != EADDRINUSE) {
+            // This is not the error we're trying to handle, so report it and exit
+            fprintf(stderr, "Failed to bind to port %d: %s\n", port, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        
+        // If binding failed with EADDRINUSE, wait a bit and try again
+        printf("Port %d is in use (attempt %d/%d), waiting 2 seconds...\n", 
+               port, bind_attempts + 1, max_attempts);
+        sleep(2); // Wait longer between attempts
+        bind_attempts++;
+    }
+    
+    if (bind_attempts == max_attempts) {
+        printf("Failed to bind to port %d after %d attempts. Try killing any existing server process.\n", 
+               port, max_attempts);
+        exit(EXIT_FAILURE);
+    }
+    
     slisten(sockfd, BACKLOG);
     
     printf("Server started on port %d, waiting for clients...\n", port);
@@ -324,11 +508,22 @@ int main(int argc, char *argv[]) {
     // Create a pipe for intercepting and forwarding broadcast messages
     int intercept_pipe[2];
     spipe(intercept_pipe);
-    
-    // Start broadcaster process - now it will write to intercept_pipe
+      // Start broadcaster process - now it will write to intercept_pipe
     broadcaster_pid = sfork();
-    if (broadcaster_pid == 0) {
-        // Child process (broadcaster)
+    if (broadcaster_pid == 0) {        // Child process (broadcaster) - ignore SIGINT to avoid multiple handlers
+        struct sigaction sa_ignore;
+        sa_ignore.sa_handler = SIG_IGN; // Ignore SIGINT
+        sigemptyset(&sa_ignore.sa_mask);
+        sa_ignore.sa_flags = 0;
+        sigaction(SIGINT, &sa_ignore, NULL);
+        
+        // Set up SIGUSR1 handler for broadcaster
+        struct sigaction sa_usr1;
+        sa_usr1.sa_handler = sigusr1_handler;
+        sigemptyset(&sa_usr1.sa_mask);
+        sa_usr1.sa_flags = 0;
+        sigaction(SIGUSR1, &sa_usr1, NULL);
+        
         sclose(broadcast_pipe[1]);  // Close write end
         sclose(intercept_pipe[0]);  // Close read end of intercept pipe
         
@@ -339,16 +534,28 @@ int main(int argc, char *argv[]) {
         
         while (1) {
             // Poll for incoming messages
-            int poll_result = spoll(&poll_fd, 1, -1);
-            
-            if (poll_result > 0 && (poll_fd.revents & POLLIN)) {
+            int poll_result = poll_with_retry(&poll_fd, 1, -1);
+              if (poll_result > 0 && (poll_fd.revents & POLLIN)) {
                 // Nous allons lire le message complet
                 union Message msg;
                 memset(&msg, 0, sizeof(union Message));
-                ssize_t bytes_read = sread(broadcast_pipe[0], &msg, sizeof(union Message));
+                
+                // Handle EINTR for read operations
+                ssize_t bytes_read;
+                do {
+                    bytes_read = read(broadcast_pipe[0], &msg, sizeof(union Message));
+                    if (bytes_read < 0 && errno == EINTR) {
+                        // If interrupted by signal, just try again
+                        printf("Broadcaster read was interrupted by signal, retrying...\n");
+                        continue;
+                    }
+                } while (bytes_read < 0 && errno == EINTR);
                 
                 if (bytes_read <= 0) {
-                    break;  // Pipe closed
+                    if (bytes_read < 0) {
+                        perror("Broadcaster read error");
+                    }
+                    break;  // Pipe closed or error
                 }
                 
                 // Log le message reçu
@@ -367,54 +574,127 @@ int main(int argc, char *argv[]) {
     // Parent process continues
     sclose(broadcast_pipe[0]);  // Close read end of broadcast_pipe
     sclose(intercept_pipe[1]);  // Close write end of intercept_pipe
-    
-    while (running) {
+      while (running) {
+        // At the start of each main loop, check if we need to exit (we're in IDLE phase)
+        if (shutdown_requested && current_phase == PHASE_IDLE) {
+            printf("Shutdown requested while server is idle, exiting\n");
+            running = false;
+            break;
+        }
+        
         printf("Waiting for players to connect...\n");
         
         // Game registration phase (30 seconds timeout)
         int client_sockets[MAX_CLIENTS] = {-1, -1};
         int client_count = 0;
         
-        // Set timeout for client connections
-        alarm(REGISTRATION_TIMEOUT);
+        // Reset the timeout flag before starting a new registration phase
+        registration_timed_out = false;
         
-        // Accept client connections
-        while (client_count < MAX_CLIENTS && running) {
-            int client_socket = saccept(sockfd);
+        // Set the server phase to IDLE (waiting for first player)
+        current_phase = PHASE_IDLE;
+        
+        // Set a 30-second alarm for registration phase, but only after first player connects
+        alarm(0); // Clear any previous alarm
+          // Accept client connections
+        while (client_count < MAX_CLIENTS && running && !registration_timed_out) {
+            // We'll use poll with a timeout to check running flag periodically
+            struct pollfd poll_fd;
+            poll_fd.fd = sockfd;
+            poll_fd.events = POLLIN;
             
-            // Cancel the timeout since we got a connection
-            alarm(0);
+            // Use a short poll timeout to check the running flag regularly
+            int poll_result = poll_with_retry(&poll_fd, 1, 1000); // 1 second timeout
             
-            client_sockets[client_count] = client_socket;
-            client_count++;
+            // Check if we need to stop due to SIGINT when we're in IDLE phase
+            // We only set running=false immediately if in IDLE phase with no players
+            if (!running && client_count == 0) {
+                printf("Shutdown requested while server is idle with no clients, exiting immediately\n");
+                break;
+            }
             
-            printf("Client %d connected\n", client_count);
+            // Check if registration timed out
+            if (registration_timed_out) {
+                printf("Registration phase timed out, disconnecting players and restarting\n");
+                break; // Exit the connection loop to handle timeout
+            }
             
-            // Set new timeout if we need more clients
-            if (client_count < MAX_CLIENTS) {
-                alarm(REGISTRATION_TIMEOUT);
+            // If no activity on the socket, continue polling
+            if (poll_result == 0) {
+                continue;
+            }
+            
+            // Accept connection if available
+            if (poll_result > 0 && (poll_fd.revents & POLLIN)) {
+                int client_socket = saccept(sockfd);
+                
+                client_sockets[client_count] = client_socket;
+                client_count++;
+                
+                printf("Client %d connected\n", client_count);
+                
+                // Start the 30-second timer after first player connects
+                if (client_count == 1) {
+                    // Change phase to REGISTRATION after first player connects
+                    current_phase = PHASE_REGISTRATION;
+                    printf("First player connected. Registration phase started: %d seconds timeout\n", REGISTRATION_TIMEOUT);
+                    alarm(REGISTRATION_TIMEOUT);
+                }
+                
+                // If we've got all required clients, cancel the alarm
+                if (client_count == MAX_CLIENTS) {
+                    alarm(0);  // Cancel the alarm
+                    printf("All players connected, registration phase complete\n");
+                }
             }
         }
         
-        // If we didn't get enough clients, disconnect and restart
-        if (client_count < MAX_CLIENTS || !running) {
-            printf("Not enough players connected or server stopping. Cleaning up.\n");
+        // Cancel alarm in case we're exiting the loop for another reason
+        alarm(0);
+        
+        // If we didn't get enough clients or received SIGALRM, disconnect and restart
+        if (client_count < MAX_CLIENTS || registration_timed_out) {
+            printf("Not enough players connected. Disconnecting players and restarting registration.\n");
             for (int i = 0; i < client_count; i++) {
                 sclose(client_sockets[i]);
+                client_sockets[i] = -1;
+            }
+              // Reset back to IDLE phase
+            current_phase = PHASE_IDLE;
+            
+            // Check if shutdown was requested during any previous phase
+            if (shutdown_requested) {
+                printf("Shutdown requested and returning to IDLE phase, exiting server\n");
+                running = false; // Only set running=false when back in IDLE phase
+                break;
             }
             
-            if (!running) break;
             continue;  // Restart registration phase
         }
+        
+        // Change to GAME phase
+        current_phase = PHASE_GAME;
+        printf("Entering GAME phase\n");
         
         // Reset game state for new game
         reset_gamestate(state);
         
         // Fork a process to handle the interception and forwarding of messages to clients
         pid_t forwarder_pid = sfork();
-        
-        if (forwarder_pid == 0) {
-            // Child process (forwarder)
+          if (forwarder_pid == 0) {            // Child process (forwarder) - ignore SIGINT to avoid multiple handlers
+            struct sigaction sa_ignore;
+            sa_ignore.sa_handler = SIG_IGN; // Ignore SIGINT
+            sigemptyset(&sa_ignore.sa_mask);
+            sa_ignore.sa_flags = 0;
+            sigaction(SIGINT, &sa_ignore, NULL);
+            
+            // Set up SIGUSR1 handler for forwarder
+            struct sigaction sa_usr1;
+            sa_usr1.sa_handler = sigusr1_handler;
+            sigemptyset(&sa_usr1.sa_mask);
+            sa_usr1.sa_flags = 0;
+            sigaction(SIGUSR1, &sa_usr1, NULL);
+            
             printf("Message forwarder started\n");
             
             // Set up polling for interceptor pipe
@@ -422,16 +702,28 @@ int main(int argc, char *argv[]) {
             poll_fd.fd = intercept_pipe[0];
             poll_fd.events = POLLIN;
             
-            while (1) {
-                int poll_result = spoll(&poll_fd, 1, -1);
+            while (1) {                int poll_result = poll_with_retry(&poll_fd, 1, -1);
                 
                 if (poll_result > 0 && (poll_fd.revents & POLLIN)) {
                     union Message msg;
                     memset(&msg, 0, sizeof(union Message));
-                    ssize_t bytes_read = sread(intercept_pipe[0], &msg, sizeof(union Message));
+                    
+                    // Handle EINTR for read operations
+                    ssize_t bytes_read;
+                    do {
+                        bytes_read = read(intercept_pipe[0], &msg, sizeof(union Message));
+                        if (bytes_read < 0 && errno == EINTR) {
+                            // If interrupted by signal, just try again
+                            printf("Forwarder read was interrupted by signal, retrying...\n");
+                            continue;
+                        }
+                    } while (bytes_read < 0 && errno == EINTR);
                     
                     if (bytes_read <= 0) {
-                        break;  // Pipe closed
+                        if (bytes_read < 0) {
+                            perror("Forwarder read error");
+                        }
+                        break;  // Pipe closed or error
                     }
                     
                     // Envoyer le message à tous les clients
@@ -465,9 +757,21 @@ int main(int argc, char *argv[]) {
         
         // Create handler processes for each client
         for (int i = 0; i < client_count; i++) {
-            int player_id = i + 1;
-            client_handlers[i] = sfork();
-            if (client_handlers[i] == 0) {
+            int player_id = i + 1;            client_handlers[i] = sfork();
+            if (client_handlers[i] == 0) {                // Child process - ignore SIGINT to avoid multiple handlers
+                struct sigaction sa_ignore;
+                sa_ignore.sa_handler = SIG_IGN; // Ignore SIGINT
+                sigemptyset(&sa_ignore.sa_mask);
+                sa_ignore.sa_flags = 0;
+                sigaction(SIGINT, &sa_ignore, NULL);
+                
+                // Set up SIGUSR1 handler for client handler
+                struct sigaction sa_usr1;
+                sa_usr1.sa_handler = sigusr1_handler;
+                sigemptyset(&sa_usr1.sa_mask);
+                sa_usr1.sa_flags = 0;
+                sigaction(SIGUSR1, &sa_usr1, NULL);
+
                 // Dans le processus fils, on ferme les sockets des autres clients
                 for (int j = 0; j < client_count; j++) {
                     if (j != i && client_sockets[j] != -1) {
@@ -481,21 +785,65 @@ int main(int argc, char *argv[]) {
                 client_handler(player_id, client_sockets[i]);
                 exit(EXIT_SUCCESS);
             }
-        }
+        }          // Wait for client handlers to finish - this will be the game phase
+        printf("Game is now running. It will continue until completion even if shutdown is requested.\n");
         
-        // Wait for client handlers to finish
+        // Use a flag to track if the game ended naturally with a "game over"
+        // or if it was interrupted by SIGINT
+        bool game_interrupted = false;
+        
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (client_handlers[i] > 0) {
-                swaitpid(client_handlers[i], NULL, 0);
+                // Use waitpid directly with error handling for EINTR
+                int status;
+                pid_t result;
+                do {
+                    result = waitpid(client_handlers[i], &status, 0);
+                    if (result == -1 && errno == EINTR) {
+                        if (shutdown_requested) {
+                            // SIGINT was received, but we should let the game continue
+                            printf("Waitpid was interrupted by SIGINT, but we'll keep waiting for game to complete...\n");
+                            game_interrupted = true;
+                        } else {
+                            printf("Waitpid was interrupted by signal, retrying...\n");
+                        }
+                    }
+                } while (result == -1 && errno == EINTR);
+                
+                // Only report errors that aren't caused by interrupted system call
+                if (result == -1 && errno != EINTR) {
+                    perror("Error waiting for client handler");
+                }
+                
+                // Check exit status of client handler to verify if it exited normally or was terminated
+                if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                    printf("Client handler %d exited normally\n", i+1);
+                } else {
+                    printf("Client handler %d terminated abnormally\n", i+1);
+                    game_interrupted = true;
+                }
+                
                 client_handlers[i] = -1;
             }
         }
         
+        if (!game_interrupted) {
+            printf("Game has ended naturally with a game over.\n");
+        } else {
+            printf("Game was interrupted by SIGINT but handled gracefully.\n");
+        }
+        
         // Kill forwarder
         skill(forwarder_pid, SIGTERM);
-        swaitpid(forwarder_pid, NULL, 0);
-        
-        printf("Game ended\n");
+        // Use waitpid directly with error handling for EINTR
+        int fw_status;
+        pid_t fw_result;
+        do {
+            fw_result = waitpid(forwarder_pid, &fw_status, 0);
+            if (fw_result == -1 && errno == EINTR) {
+                printf("Waitpid for forwarder was interrupted by signal, retrying...\n");
+            }
+        } while (fw_result == -1 && errno == EINTR);
         
         // Close client sockets
         for (int i = 0; i < client_count; i++) {
@@ -503,6 +851,15 @@ int main(int argc, char *argv[]) {
                 sclose(client_sockets[i]);
                 client_sockets[i] = -1;
             }
+        }
+          // Set the server phase back to IDLE after game completes
+        current_phase = PHASE_IDLE;
+        
+        // After a game is complete, check if shutdown was requested during any phase
+        if (shutdown_requested) {
+            printf("Shutdown requested and game has ended, returning to IDLE phase, exiting server\n");
+            running = false; // Only set running=false when back in IDLE phase
+            break;
         }
     }
     
