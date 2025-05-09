@@ -375,9 +375,6 @@ int main(int argc, char *argv[]) {
         int client_sockets[MAX_CLIENTS] = {-1, -1};
         int client_count = 0;
         
-        // Set timeout for client connections
-        alarm(REGISTRATION_TIMEOUT);
-        
         // Accept client connections
         while (client_count < MAX_CLIENTS && running) {
             int client_socket = saccept(sockfd);

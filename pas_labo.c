@@ -38,6 +38,7 @@ void print_mini_map(const char* map_file);
 void print_progress_bar(int current, int total, int width);
 int count_moves_in_file(const char* filename);
 void visualize_move(char move, int player_num);
+void send_test_status(const char* message, int pipe_fd);
 
 // Clean up resources
 void cleanup() {
@@ -91,12 +92,19 @@ void print_mini_map(const char* map_file) {
     fclose(map);
 }
 
-// Visual representation of moves
+// Visual representation of moves in terminal
+// Visual representation of moves in terminal
 void visualize_move(char move, int player_num) {
     const char* color = (player_num == 1) ? ANSI_COLOR_GREEN : ANSI_COLOR_RED;
-    char arrow = ' ';
+    char arrow;
     
-    
+    switch(move) {
+        case '^': arrow = 'U'; break; // Up arrow
+        case 'v': arrow = 'D'; break; // Down arrow
+        case '<': arrow = 'L'; break; // Left arrow
+        case '>': arrow = 'R'; break; // Right arrow
+        default: arrow = '?'; break;
+    }
     
     printf("%sP%d:%c " ANSI_COLOR_RESET, color, player_num, arrow);
     fflush(stdout);
@@ -116,6 +124,14 @@ void print_progress_bar(int current, int total, int width) {
     fflush(stdout);
 }
 
+// Send test status message to display in game screen
+void send_test_status(const char* message, int pipe_fd) {
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "TEST:%s", message);
+    write(pipe_fd, buffer, strlen(buffer));
+    usleep(100000); // Give time for the client to process it
+}
+
 // Count moves in a file
 int count_moves_in_file(const char* filename) {
     int fd = sopen(filename, O_RDONLY, 0);
@@ -130,7 +146,11 @@ int count_moves_in_file(const char* filename) {
     }
     
     sclose(fd);
-    lseek(fd, 0, SEEK_SET); // Reset file position for later reading
+    
+    // Open the file again to reset position
+    fd = sopen(filename, O_RDONLY, 0);
+    sclose(fd);
+    
     return count;
 }
 
@@ -210,7 +230,7 @@ int main(int argc, char *argv[]) {
     printf(ANSI_COLOR_GREEN "✓ Server started (PID: %d)\n" ANSI_COLOR_RESET, server_pid);
     
     // Wait longer for the server to start
-    usleep(1000000);  // 1 second
+    usleep(2000000);  // 2 seconds
     
     // Start client 1
     client1_pid = fork();
@@ -278,6 +298,20 @@ int main(int argc, char *argv[]) {
     printf(ANSI_COLOR_YELLOW "Waiting for clients to initialize (3 seconds)...\n" ANSI_COLOR_RESET);
     usleep(3000000);  // 3 seconds
     
+    // Send initial test status message to be displayed in Player 1's game screen
+    send_test_status("*** TEST STARTING ***", pipe_client1[1]);
+    usleep(500000);
+    
+    // Send information about test configuration
+    char info_buffer[256];
+    snprintf(info_buffer, sizeof(info_buffer), "Map: %s", map_file);
+    send_test_status(info_buffer, pipe_client1[1]);
+    usleep(300000);
+    
+    snprintf(info_buffer, sizeof(info_buffer), "Moves - P1: %d, P2: %d", p1_expected, p2_expected);
+    send_test_status(info_buffer, pipe_client1[1]);
+    usleep(300000);
+    
     // Open player movement files
     int fd_player1 = sopen(player1_file, O_RDONLY, 0);
     int fd_player2 = sopen(player2_file, O_RDONLY, 0);
@@ -286,11 +320,10 @@ int main(int argc, char *argv[]) {
     printf(ANSI_BOLD "║    EXECUTING MOVES...    ║\n" ANSI_COLOR_RESET);
     printf(ANSI_BOLD "╚═════════════════════════╝\n\n" ANSI_COLOR_RESET);
     
-    printf("Movement sequence: ");
+    send_test_status("EXECUTING MOVES...", pipe_client1[1]);
+    usleep(500000);
     
-    // Use temporary files to store position
-    lseek(fd_player1, 0, SEEK_SET);
-    lseek(fd_player2, 0, SEEK_SET);
+    printf("Movement sequence: ");
     
     // Variables for tracking move reading
     char move_p1, move_p2;
@@ -310,10 +343,22 @@ int main(int argc, char *argv[]) {
             } while (move_p1 == ' ' || move_p1 == '\n' || move_p1 == '\r' || move_p1 == '\t');
             
             if (!end_p1 && (move_p1 == '>' || move_p1 == '<' || move_p1 == 'v' || move_p1 == '^')) {
+                // Send move to client
                 write(pipe_client1[1], &move_p1, 1);
+                
+                // Display in terminal
                 visualize_move(move_p1, 1);
                 p1_moves++;
                 current_move++;
+                
+                // Update status in game screen occasionally
+                if (p1_moves % 5 == 0) {
+                    snprintf(info_buffer, sizeof(info_buffer), "Progress: %d/%d moves (%d%%)", 
+                             current_move, total_moves, (current_move * 100) / total_moves);
+                    send_test_status(info_buffer, pipe_client1[1]);
+                }
+                
+                // Wait between moves
                 usleep(500000); // 0.5 seconds between moves
             }
         }
@@ -329,10 +374,15 @@ int main(int argc, char *argv[]) {
             } while (move_p2 == ' ' || move_p2 == '\n' || move_p2 == '\r' || move_p2 == '\t');
             
             if (!end_p2 && (move_p2 == '>' || move_p2 == '<' || move_p2 == 'v' || move_p2 == '^')) {
+                // Send move to client
                 write(pipe_client2[1], &move_p2, 1);
+                
+                // Display in terminal
                 visualize_move(move_p2, 2);
                 p2_moves++;
                 current_move++;
+                
+                // Wait between moves
                 usleep(500000); // 0.5 seconds between moves
             }
         }
@@ -354,6 +404,18 @@ int main(int argc, char *argv[]) {
     // Show final progress
     print_progress_bar(total_moves, total_moves, 40);
     
+    // Send test completion message to game screen
+    snprintf(info_buffer, sizeof(info_buffer), "*** TEST COMPLETE ***");
+    send_test_status(info_buffer, pipe_client1[1]);
+    usleep(300000);
+    
+    snprintf(info_buffer, sizeof(info_buffer), "P1: %d moves, P2: %d moves", p1_moves, p2_moves);
+    send_test_status(info_buffer, pipe_client1[1]);
+    usleep(300000);
+    
+    snprintf(info_buffer, sizeof(info_buffer), "Duration: %.2f sec", test_duration);
+    send_test_status(info_buffer, pipe_client1[1]);
+    
     printf("\n\n");
     printf(ANSI_BOLD "╔════════════════════════════════════════╗\n" ANSI_COLOR_RESET);
     printf(ANSI_BOLD "║       TEST SEQUENCE COMPLETED          ║\n" ANSI_COLOR_RESET);
@@ -362,8 +424,8 @@ int main(int argc, char *argv[]) {
     // Print test summary
     printf(ANSI_COLOR_YELLOW "\nTest Summary:\n" ANSI_COLOR_RESET);
     printf("┌─────────────────────────────────┐\n");
-    printf("│ Total Player 1 Moves: %-10d │\n", p1_moves);
-    printf("│ Total Player 2 Moves: %-10d │\n", p2_moves);
+    printf("│ Total Player 1 Moves: %-9d │\n", p1_moves);
+    printf("│ Total Player 2 Moves: %-9d │\n", p2_moves);
     printf("│ Test Duration: %-15.2fs │\n", test_duration);
     printf("└─────────────────────────────────┘\n");
     
